@@ -32,9 +32,11 @@ from tunix.perf import metrics as perf_metrics
 from tunix.perf.experimental import export as perf_export_v2
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.grpo import grpo_learner
+from tunix.rl.grpo import rloo_learner
 from tunix.rl.rollout import base_rollout
 
 GrpoConfig = grpo_learner.GrpoConfig
+RLOOConfig = rloo_learner.RLOOConfig
 
 _PATHWAYS_BNS = flags.DEFINE_string(
     "pathways_bns", None, "BNS address of the Pathways server."
@@ -290,11 +292,28 @@ class GrpoPipeline(config.HyperParameters):
         ),
     )
     rl_cluster = self.create_rl_cluster(tokenizer)
-    grpo_trainer = grpo_learner.GrpoLearner(
-        rl_cluster=rl_cluster,
-        reward_fns=self.obtain_reward_fn(),
-        algo_config=GrpoConfig(**self.config["grpo_config"]),
-    )
+    grpo_config = self.config["grpo_config"]
+    advantage_estimator = grpo_config.get("advantage_estimator", "grpo")
+
+    if advantage_estimator == "rloo":
+      # Filter out init=False fields that RLOOConfig sets internally.
+      rloo_kwargs = {
+          k: v for k, v in grpo_config.items()
+          if k not in ("algo_variant", "advantage_estimator")
+      }
+      algo_config = RLOOConfig(**rloo_kwargs)
+      grpo_trainer = rloo_learner.RLOOLearner(
+          rl_cluster=rl_cluster,
+          reward_fns=self.obtain_reward_fn(),
+          algo_config=algo_config,
+      )
+    else:
+      algo_config = GrpoConfig(**grpo_config)
+      grpo_trainer = grpo_learner.GrpoLearner(
+          rl_cluster=rl_cluster,
+          reward_fns=self.obtain_reward_fn(),
+          algo_config=algo_config,
+      )
     grpo_trainer.train(dataset)
 
 
