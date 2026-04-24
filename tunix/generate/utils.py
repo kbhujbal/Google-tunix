@@ -1050,6 +1050,63 @@ def _fuse_moe_weights(src_flat: Dict[Tuple[str, ...], Any], tgt_flat: Dict[Tuple
   return new_src_flat
 
 
+def _collect_src_buffer_ids(src_flat: Mapping[Any, Any]) -> set:
+  """Collects physical device buffer pointers for arrays in src_flat.
+
+  Used to detect when a target jax.Array shares its underlying buffer with a
+  source array — Python identity (`is`) is insufficient because two distinct
+  jax.Array wrappers can back the same physical shard (e.g. when source slices
+  come from a scanned tensor that also backs another spec entry).
+  """
+  ids = set()
+  for v in src_flat.values():
+    arr = v.value if hasattr(v, 'value') else v
+    if not hasattr(arr, 'addressable_shards'):
+      continue
+    for shard in arr.addressable_shards:
+      try:
+        ids.add(shard.data.unsafe_buffer_pointer())
+      except Exception:  # pylint: disable=broad-except
+        pass
+  return ids
+
+
+def _delete_target_buffers(
+    spec_flat: Mapping[Any, Any],
+    src_flat: Mapping[Any, Any],
+) -> None:
+  """Deletes target arrays in spec_flat that don't alias any source shard."""
+  src_buffer_ids = _collect_src_buffer_ids(src_flat)
+  for tgt_val in spec_flat.values():
+    tgt_arr = tgt_val.value if hasattr(tgt_val, 'value') else tgt_val
+    if not hasattr(tgt_arr, 'delete') or getattr(
+        tgt_arr, 'is_deleted', lambda: False
+    )():
+      continue
+    if hasattr(tgt_arr, 'addressable_shards') and any(
+        shard.data.unsafe_buffer_pointer() in src_buffer_ids
+        for shard in tgt_arr.addressable_shards
+    ):
+      continue
+    tgt_arr.delete()
+
+
+def _snapshot_dst_sharding(arr: Any) -> Any:
+  """Snapshots a destination sharding leaf for reshard_fn's target tree.
+
+  Captured *before* any potential `.delete()` on `arr` so the caller never
+  needs to dereference a deleted jax.Array later. `reshard_pytree`'s
+  `_get_dst_sharding` accepts `NamedSharding` / `SingleDeviceSharding` leaves
+  directly, so for those we return the existing sharding object (no rebuild).
+  """
+  s = arr.sharding
+  if isinstance(
+      s, (jax.sharding.NamedSharding, jax.sharding.SingleDeviceSharding)
+  ):
+    return s
+  return jax.sharding.NamedSharding(s.mesh, s.spec, memory_kind=s.memory_kind)
+
+
 def _reshard_in_chunks(
     src_flat: Dict[Tuple[str, ...], Any],
     spec_flat: Dict[Tuple[str, ...], Any],
@@ -1085,29 +1142,32 @@ def _reshard_in_chunks(
     chunk_keys = keys[start : start + chunk_size]
     chunk_src_flat = {}
     chunk_spec_flat = {}
+    chunk_dst_shardings_flat = {}
     for k in chunk_keys:
       src_val = src_flat.pop(k)
       tgt_val = spec_flat[k]
       chunk_src_flat[k] = src_val
       chunk_spec_flat[k] = tgt_val
+      tgt_arr = tgt_val.value if hasattr(tgt_val, 'value') else tgt_val
+      chunk_dst_shardings_flat[k] = _snapshot_dst_sharding(tgt_arr)
 
-      if delete_spec_buffers:
-        tgt_arr = tgt_val.value if hasattr(tgt_val, 'value') else tgt_val
-        src_arr = src_val.value if hasattr(src_val, 'value') else src_val
-        if (
-            hasattr(tgt_arr, 'delete')
-            and not getattr(tgt_arr, 'is_deleted', lambda: False)()
-            and tgt_arr is not src_arr
-        ):
-          tgt_arr.delete()
+    if delete_spec_buffers:
+      _delete_target_buffers(chunk_spec_flat, chunk_src_flat)
 
     chunk_src = traverse_util.unflatten_dict(chunk_src_flat)
-    chunk_spec = traverse_util.unflatten_dict(chunk_spec_flat)
-    chunk_resharded = reshard_fn(source=chunk_src, target=chunk_spec)
+    chunk_dst_shardings = traverse_util.unflatten_dict(chunk_dst_shardings_flat)
+    chunk_resharded = reshard_fn(source=chunk_src, target=chunk_dst_shardings)
     jax.block_until_ready(chunk_resharded)
     resharded.update(traverse_util.flatten_dict(chunk_resharded))
 
-    del chunk_src, chunk_spec, chunk_resharded, chunk_src_flat, chunk_spec_flat
+    del (
+        chunk_src,
+        chunk_dst_shardings,
+        chunk_resharded,
+        chunk_src_flat,
+        chunk_spec_flat,
+        chunk_dst_shardings_flat,
+    )
   return resharded
 
 
@@ -1133,13 +1193,18 @@ def transfer_state_directly(
     dst_state: The destination state to transfer to.
     reshard_fn: A function to shard the values.
     scan_axis: The axis along which to unroll scanned layers, if needed.
-    delete_dst_buffers: Whether to delete buffers in the destination state after
-      transfer to save memory.
+    delete_dst_buffers: Whether to delete buffers in the destination state
+      before resharding to save HBM. Buffers that physically alias a source
+      shard are preserved automatically (see `_delete_target_buffers`).
     reshard_chunk_size: When set, the final reshard is split into sequential
-      groups of this many flat keys instead of one monolithic call. This reduces
-      peak contiguous HBM pressure, which prevents XLA allocator fragmentation
-      errors on large models. When None (default) the original single-call
-      reshard behavior is preserved.
+      groups of this many flat keys instead of one monolithic call. This
+      reduces peak contiguous HBM pressure, which prevents XLA allocator
+      fragmentation on large models. The unit is *number of flat keys per
+      chunk* — per-layer key counts vary by architecture (MQA vs GQA, biases
+      on/off, dense vs MoE, fused vs split MoE gates), so as a rule of thumb
+      start with roughly `10 * num_layers` for a dense transformer and tune
+      downward if you still see fragmentation. When None (default) the
+      original single-call reshard behavior is preserved.
   """
   def safe_has_key(obj: Mapping[str, Any], key: str) -> bool:
     if isinstance(obj, dict):
@@ -1322,9 +1387,9 @@ def transfer_state_directly(
   # Reshard and Update
   if reshard_chunk_size is not None:
     # Chunked path: split the flat weight dict into groups of reshard_chunk_size
-    # keys and reshard each group independently. This keeps peak contiguous HBM
-    # allocation proportional to chunk_size, avoiding XLA fragmentation errors
-    # on large models without needing to clear the compilation cache.
+    # entries and reshard each group independently. This keeps peak contiguous
+    # HBM allocation proportional to chunk_size, avoiding XLA fragmentation
+    # errors on large models without needing to clear the compilation cache.
     src_flat = traverse_util.flatten_dict(final_source)
     spec_flat = traverse_util.flatten_dict(final_spec)
     del final_source, final_spec
@@ -1337,24 +1402,27 @@ def transfer_state_directly(
     )
     resharded_weights = traverse_util.unflatten_dict(resharded_flat)
   else:
-    if delete_dst_buffers:
-      src_flat = traverse_util.flatten_dict(final_source)
-      spec_flat = traverse_util.flatten_dict(final_spec)
-      for k, tgt_val in spec_flat.items():
-        if k in src_flat:
-          src_val = src_flat[k]
-          tgt_arr = tgt_val.value if hasattr(tgt_val, 'value') else tgt_val
-          src_arr = src_val.value if hasattr(src_val, 'value') else src_val
-          if (
-              hasattr(tgt_arr, 'delete')
-              and not getattr(tgt_arr, 'is_deleted', lambda: False)()
-              and tgt_arr is not src_arr
-          ):
-            tgt_arr.delete()
+    src_flat = traverse_util.flatten_dict(final_source)
+    spec_flat = traverse_util.flatten_dict(final_spec)
 
+    # Snapshot dst shardings before any deletion so reshard_fn never has to
+    # touch a deleted jax.Array. reshard_pytree's _get_dst_sharding accepts
+    # NamedSharding leaves directly, so this is a drop-in substitute for
+    # passing the array objects.
+    dst_shardings_flat = {
+        k: _snapshot_dst_sharding(
+            tgt_val.value if hasattr(tgt_val, 'value') else tgt_val
+        )
+        for k, tgt_val in spec_flat.items()
+    }
+
+    if delete_dst_buffers:
+      _delete_target_buffers(spec_flat, src_flat)
+
+    del final_spec
     resharded_weights = reshard_fn(
         source=final_source,
-        target=final_spec,
+        target=traverse_util.unflatten_dict(dst_shardings_flat),
     )
   nnx.update(dst_state, resharded_weights)
 
