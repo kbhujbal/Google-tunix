@@ -744,6 +744,14 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     train_data_gen = self._data_consumer_batch_generator(
         train_data_queue, train_micro_batch_size
     )
+    if self._training_config.max_seq_token_per_tpu is not None:
+      logging.info(
+          "Using sequence packing with max_seq_token_per_tpu: %d",
+          self._training_config.max_seq_token_per_tpu,
+      )
+      train_data_gen = rl_utils.pack_sequences(
+          train_data_gen, self._training_config.max_seq_token_per_tpu
+      )
     micro_batches_since_last_sync = 0
     micro_batches_per_full_batch = full_batch_size // train_micro_batch_size
     for train_micro_batch in train_data_gen:
