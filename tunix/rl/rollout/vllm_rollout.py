@@ -71,6 +71,7 @@ class VllmRollout(base_rollout.BaseRollout):
                 "max_logprobs": (
                     1
                 ),  # We only need the logprobs of the sampled tokens
+                "logprobs_mode": rollout_config.rollout_vllm_logprobs_mode,
                 **rollout_config.rollout_vllm_kwargs,
             },
             sampling_kwargs=rollout_config.rollout_vllm_sampling_kwargs,
